@@ -1,28 +1,6 @@
-# 🌤 WeatherBet — Polymarket Weather Trading Bot
+# WeatherBet — Polymarket Weather Trading Bot
 
 Automated weather market trading bot for Polymarket. Finds mispriced temperature outcomes using real forecast data from multiple sources across 20 cities worldwide.
-
-No SDK. No black box. Pure Python.
-
----
-
-## Versions
-
-### `bot_v1.py` — Base Bot
-The foundation. Scans 6 US cities, fetches forecasts from NWS using airport station coordinates, finds matching temperature buckets on Polymarket, and enters trades when the market price is below the entry threshold.
-
-No math, no complexity. Just the core logic — good for understanding how the system works.
-
-### `weatherbet.py` — Full Bot (current)
-Everything in v1, plus:
-- **20 cities** across 4 continents (US, Europe, Asia, South America, Oceania)
-- **3 forecast sources** — ECMWF (global), HRRR/GFS (US, hourly), METAR (real-time observations)
-- **Expected Value** — skips trades where the math doesn't work
-- **Kelly Criterion** — sizes positions based on edge strength
-- **Stop-loss + trailing stop** — 20% stop, moves to breakeven at +20%
-- **Slippage filter** — skips markets with spread > $0.03
-- **Self-calibration** — learns forecast accuracy per city over time
-- **Full data storage** — every forecast snapshot, trade, and resolution saved to JSON
 
 ---
 
@@ -37,7 +15,21 @@ The bot:
 4. Calculates Expected Value — only enters if the math is positive
 5. Sizes the position using fractional Kelly Criterion
 6. Monitors stops every 10 minutes, full scan every hour
-7. Auto-resolves markets by querying Polymarket API directly
+7. Auto-resolves markets by querying Polymarket via the `polymarket-client` SDK
+
+---
+
+## Features
+
+- **20 cities** across 4 continents (US, Europe, Asia, South America, Oceania)
+- **3 forecast sources** — ECMWF (global), HRRR/GFS (US, hourly), METAR (real-time observations)
+- **Expected Value** — skips trades where the math doesn't work
+- **Kelly Criterion** — sizes positions based on edge strength
+- **Stop-loss + trailing stop** — 20% stop, moves to breakeven at +20%
+- **Slippage filter** — skips markets with spread > $0.03
+- **Self-calibration** — learns forecast accuracy per city over time
+- **Full data storage** — every forecast snapshot, trade, and resolution saved to JSON
+- **Paper / live toggle** — runs fully simulated by default; set `live_trading: true` to place real orders
 
 ---
 
@@ -62,10 +54,9 @@ Every Polymarket weather market resolves on a specific airport station. NYC reso
 ---
 
 ## Installation
+
 ```bash
-git clone https://github.com/alteregoeth-ai/weatherbot
-cd weatherbot
-pip install requests
+pip install requests polymarket-client
 ```
 
 Create `config.json` in the project folder:
@@ -73,24 +64,26 @@ Create `config.json` in the project folder:
 {
   "balance": 10000.0,
   "max_bet": 20.0,
-  "min_ev": 0.05,
+  "min_ev": 0.1,
   "max_price": 0.45,
-  "min_volume": 2000,
+  "min_volume": 500,
   "min_hours": 2.0,
   "max_hours": 72.0,
   "kelly_fraction": 0.25,
   "max_slippage": 0.03,
   "scan_interval": 3600,
   "calibration_min": 30,
-  "vc_key": "YOUR_VISUAL_CROSSING_KEY"
+  "vc_key": "YOUR_VISUAL_CROSSING_KEY",
+  "live_trading": false
 }
 ```
 
-Get a free Visual Crossing API key at visualcrossing.com — used to fetch actual temperatures after market resolution.
+Get a free Visual Crossing API key at [visualcrossing.com](https://www.visualcrossing.com) — used to fetch actual temperatures after market resolution.
 
 ---
 
 ## Usage
+
 ```bash
 python weatherbet.py           # start the bot — scans every hour
 python weatherbet.py status    # balance and open positions
@@ -99,12 +92,35 @@ python weatherbet.py report    # full breakdown of all resolved markets
 
 ---
 
+## Live Trading
+
+By default the bot runs in **paper mode** — it tracks a simulated balance in `data/state.json` and never touches real funds.
+
+To enable real order placement:
+
+1. Set `"live_trading": true` in `config.json`
+2. Export your Polymarket wallet private key:
+   ```bash
+   export POLYMARKET_PRIVATE_KEY="0x..."
+   ```
+3. On first run, approve the USDC and CTF contracts once:
+   ```python
+   from polymarket import SecureClient
+   client = SecureClient.create(private_key="0x...")
+   client.setup_trading_approvals()
+   ```
+4. Deposit USDC on Polygon to your Polymarket wallet address
+
+Paper mode is strongly recommended until you have enough resolved markets to trust the calibration.
+
+---
+
 ## Data Storage
 
 All data is saved to `data/markets/` — one JSON file per market. Each file contains:
 - Hourly forecast snapshots (ECMWF, HRRR, METAR)
 - Market price history
-- Position details (entry, stop, PnL)
+- Position details (entry price, stop, CLOB token ID, order ID, PnL)
 - Final resolution outcome
 
 This data is used for self-calibration — the bot learns forecast accuracy per city over time and adjusts position sizing accordingly.
@@ -117,11 +133,11 @@ This data is used for self-calibration — the bot learns forecast accuracy per 
 |-----|------|---------|
 | Open-Meteo | None | ECMWF + HRRR forecasts |
 | Aviation Weather (METAR) | None | Real-time station observations |
-| Polymarket Gamma | None | Market data |
+| Polymarket (`polymarket-client` SDK) | Private key (live only) | Market data + order placement |
 | Visual Crossing | Free key | Historical temps for resolution |
 
 ---
 
 ## Disclaimer
 
-This is not financial advice. Prediction markets carry real risk. Run the simulation thoroughly before committing real capital.
+This is not financial advice. Prediction markets carry real risk. Run the bot in paper mode thoroughly before committing real capital.

@@ -5,6 +5,7 @@ weatherbet.py — Weather Trading Bot for Polymarket
 =====================================================
 Tracks weather forecasts from 3 sources (ECMWF, HRRR, METAR),
 compares with Polymarket markets, paper trades using Kelly criterion.
+Paper trading by default; set live_trading: true in config.json to place real orders.
 
 Usage:
     python weatherbet.py          # main loop
@@ -12,14 +13,21 @@ Usage:
     python weatherbet.py status   # balance and open positions
 """
 
+import os
 import re
 import sys
 import json
 import math
 import time
 import requests
+from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+from dotenv import load_dotenv
+from polymarket import SecureClient, PublicClient
+
+load_dotenv()
 
 # =============================================================================
 # CONFIG
@@ -29,17 +37,18 @@ with open("config.json", encoding="utf-8") as f:
     _cfg = json.load(f)
 
 BALANCE          = _cfg.get("balance", 10000.0)
-MAX_BET          = _cfg.get("max_bet", 20.0)        # max bet per trade
+MAX_BET          = _cfg.get("max_bet", 20.0)
 MIN_EV           = _cfg.get("min_ev", 0.10)
 MAX_PRICE        = _cfg.get("max_price", 0.45)
 MIN_VOLUME       = _cfg.get("min_volume", 500)
 MIN_HOURS        = _cfg.get("min_hours", 2.0)
 MAX_HOURS        = _cfg.get("max_hours", 72.0)
 KELLY_FRACTION   = _cfg.get("kelly_fraction", 0.25)
-MAX_SLIPPAGE     = _cfg.get("max_slippage", 0.03)  # max allowed ask-bid spread
-SCAN_INTERVAL    = _cfg.get("scan_interval", 3600)   # every hour
+MAX_SLIPPAGE     = _cfg.get("max_slippage", 0.03)
+SCAN_INTERVAL    = _cfg.get("scan_interval", 3600)
 CALIBRATION_MIN  = _cfg.get("calibration_min", 30)
-VC_KEY           = _cfg.get("vc_key", "")
+VC_KEY           = os.environ.get("VC_KEY", _cfg.get("vc_key", ""))
+LIVE_TRADING     = _cfg.get("live_trading", False)
 
 SIGMA_F = 2.0
 SIGMA_C = 1.2
@@ -89,6 +98,9 @@ TIMEZONES = {
 
 MONTHS = ["january","february","march","april","may","june",
           "july","august","september","october","november","december"]
+
+# Polymarket SDK client — initialized in run_loop()
+_pm_client = None
 
 # =============================================================================
 # MATH
@@ -210,7 +222,7 @@ def get_hrrr(city_slug, dates):
         f"?latitude={loc['lat']}&longitude={loc['lon']}"
         f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
         f"&forecast_days=3&timezone={TIMEZONES.get(city_slug, 'UTC')}"
-        f"&models=gfs_seamless"  # HRRR+GFS seamless — best option for US
+        f"&models=gfs_seamless"
     )
     for attempt in range(3):
         try:
@@ -271,19 +283,19 @@ def check_market_resolved(market_id):
     Returns: None (still open), True (YES won), False (NO won)
     """
     try:
-        r = requests.get(f"https://gamma-api.polymarket.com/markets/{market_id}", timeout=(5, 8))
-        data = r.json()
-        closed = data.get("closed", False)
-        if not closed:
+        market = _pm_client.get_market(id=str(market_id))
+        if not market.state.closed:
             return None
-        # Check YES price — if ~1.0 then WIN, if ~0.0 then LOSS
-        prices = json.loads(data.get("outcomePrices", "[0.5,0.5]"))
-        yes_price = float(prices[0])
+        yes_price = (
+            float(market.outcomes.yes.price)
+            if market.outcomes and market.outcomes.yes and market.outcomes.yes.price is not None
+            else 0.5
+        )
         if yes_price >= 0.95:
-            return True   # WIN
+            return True
         elif yes_price <= 0.05:
-            return False  # LOSS
-        return None  # not yet determined
+            return False
+        return None
     except Exception as e:
         print(f"  [RESOLVE] {market_id}: {e}")
     return None
@@ -293,21 +305,10 @@ def check_market_resolved(market_id):
 # =============================================================================
 
 def get_polymarket_event(city_slug, month, day, year):
+    """Fetches the Polymarket event for the given city/date. Returns SDK Event or None."""
     slug = f"highest-temperature-in-{city_slug}-on-{month}-{day}-{year}"
     try:
-        r = requests.get(f"https://gamma-api.polymarket.com/events?slug={slug}", timeout=(5, 8))
-        data = r.json()
-        if data and isinstance(data, list) and len(data) > 0:
-            return data[0]
-    except Exception:
-        pass
-    return None
-
-def get_market_price(market_id):
-    try:
-        r = requests.get(f"https://gamma-api.polymarket.com/markets/{market_id}", timeout=(3, 5))
-        prices = json.loads(r.json().get("outcomePrices", "[0.5,0.5]"))
-        return float(prices[0])
+        return _pm_client.get_event(slug=slug)
     except Exception:
         return None
 
@@ -367,7 +368,7 @@ def load_all_markets():
             pass
     return markets
 
-def new_market(city_slug, date_str, event, hours):
+def new_market(city_slug, date_str, end_date_str, hours):
     loc = LOCATIONS[city_slug]
     return {
         "city":               city_slug,
@@ -375,16 +376,16 @@ def new_market(city_slug, date_str, event, hours):
         "date":               date_str,
         "unit":               loc["unit"],
         "station":            loc["station"],
-        "event_end_date":     event.get("endDate", ""),
+        "event_end_date":     end_date_str,
         "hours_at_discovery": round(hours, 1),
-        "status":             "open",           # open | closed | resolved
-        "position":           None,             # filled when position opens
-        "actual_temp":        None,             # filled after resolution
-        "resolved_outcome":   None,             # win / loss / no_position
+        "status":             "open",
+        "position":           None,
+        "actual_temp":        None,
+        "resolved_outcome":   None,
         "pnl":                None,
-        "forecast_snapshots": [],               # list of forecast snapshots
-        "market_snapshots":   [],               # list of market price snapshots
-        "all_outcomes":       [],               # all market buckets
+        "forecast_snapshots": [],
+        "market_snapshots":   [],
+        "all_outcomes":       [],
         "created_at":         datetime.now(timezone.utc).isoformat(),
     }
 
@@ -426,7 +427,6 @@ def take_forecast_snapshot(city_slug, dates):
             "hrrr":  hrrr.get(date) if date <= (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%d") else None,
             "metar": get_metar(city_slug) if date == today else None,
         }
-        # Best forecast: HRRR for US D+0/D+1, otherwise ECMWF
         loc = LOCATIONS[city_slug]
         if loc["region"] == "us" and snap["hrrr"] is not None:
             snap["best"] = snap["hrrr"]
@@ -439,6 +439,19 @@ def take_forecast_snapshot(city_slug, dates):
             snap["best_source"] = None
         snapshots[date] = snap
     return snapshots
+
+def _sdk_sell(clob_token_id, shares):
+    """Place a live market sell order. No-op in paper mode."""
+    if not LIVE_TRADING or not clob_token_id:
+        return
+    try:
+        _pm_client.place_market_order(
+            token_id=clob_token_id,
+            side="SELL",
+            shares=Decimal(str(shares)),
+        )
+    except Exception as e:
+        print(f"  [SELL FAIL] {e}")
 
 def scan_and_update():
     """Main function of one cycle: updates forecasts, opens/closes positions."""
@@ -469,51 +482,56 @@ def scan_and_update():
             if not event:
                 continue
 
-            end_date = event.get("endDate", "")
+            end_date = event.schedule.end_date.isoformat() if event.schedule.end_date else ""
             hours    = hours_to_resolution(end_date) if end_date else 0
             horizon  = f"D+{i}"
 
-            # Load or create market record
             mkt = load_market(city_slug, date)
             if mkt is None:
                 if hours < MIN_HOURS or hours > MAX_HOURS:
                     continue
-                mkt = new_market(city_slug, date, event, hours)
+                mkt = new_market(city_slug, date, end_date, hours)
 
-            # Skip if market already resolved
             if mkt["status"] == "resolved":
                 continue
 
-            # Update outcomes list — prices taken directly from event
+            # Update outcomes — prices fetched from CLOB via SDK
             outcomes = []
-            for market in event.get("markets", []):
-                question = market.get("question", "")
-                mid      = str(market.get("id", ""))
-                volume   = float(market.get("volume", 0))
-                rng      = parse_temp_range(question)
-                if not rng:
+            for market in event.markets:
+                question = market.question or ""
+                mid      = str(market.id)
+                volume   = float(market.metrics.volume_num or 0)
+                clob_token_id = (
+                    str(market.outcomes.yes.token_id)
+                    if market.outcomes and market.outcomes.yes and market.outcomes.yes.token_id
+                    else None
+                )
+                rng = parse_temp_range(question)
+                if not rng or not clob_token_id:
                     continue
                 try:
-                    prices = json.loads(market.get("outcomePrices", "[0.5,0.5]"))
-                    bid = float(prices[0])
-                    ask = float(prices[1]) if len(prices) > 1 else bid
+                    bid    = float(_pm_client.get_price(token_id=clob_token_id, side="SELL"))
+                    ask    = float(_pm_client.get_price(token_id=clob_token_id, side="BUY"))
+                    spread = float(_pm_client.get_spread(token_id=clob_token_id))
                 except Exception:
-                    continue
+                    bid    = float(market.prices.best_bid or 0.5)
+                    ask    = float(market.prices.best_ask or bid)
+                    spread = round(ask - bid, 4)
                 outcomes.append({
-                    "question":  question,
-                    "market_id": mid,
-                    "range":     rng,
-                    "bid":       round(bid, 4),
-                    "ask":       round(ask, 4),
-                    "price":     round(bid, 4),   # for compatibility
-                    "spread":    round(ask - bid, 4),
-                    "volume":    round(volume, 0),
+                    "question":      question,
+                    "market_id":     mid,
+                    "clob_token_id": clob_token_id,
+                    "range":         rng,
+                    "bid":           round(bid, 4),
+                    "ask":           round(ask, 4),
+                    "price":         round(bid, 4),
+                    "spread":        round(spread, 4),
+                    "volume":        round(volume, 0),
                 })
 
             outcomes.sort(key=lambda x: x["range"][0])
             mkt["all_outcomes"] = outcomes
 
-            # Forecast snapshot
             snap = snapshots.get(date, {})
             forecast_snap = {
                 "ts":          snap.get("ts"),
@@ -527,14 +545,12 @@ def scan_and_update():
             }
             mkt["forecast_snapshots"].append(forecast_snap)
 
-            # Market price snapshot
             top = max(outcomes, key=lambda x: x["price"]) if outcomes else None
-            market_snap = {
-                "ts":       snap.get("ts"),
+            mkt["market_snapshots"].append({
+                "ts":         snap.get("ts"),
                 "top_bucket": f"{top['range'][0]}-{top['range'][1]}{unit_sym}" if top else None,
                 "top_price":  top["price"] if top else None,
-            }
-            mkt["market_snapshots"].append(market_snap)
+            })
 
             forecast_temp = snap.get("best")
             best_source   = snap.get("best_source")
@@ -545,21 +561,19 @@ def scan_and_update():
                 current_price = None
                 for o in outcomes:
                     if o["market_id"] == pos["market_id"]:
-                        current_price = o["price"]
+                        current_price = o.get("bid", o["price"])
                         break
 
                 if current_price is not None:
-                    current_price = o.get("bid", current_price)  # sell at bid
                     entry = pos["entry_price"]
-                    stop  = pos.get("stop_price", entry * 0.80)  # 20% stop by default
+                    stop  = pos.get("stop_price", entry * 0.80)
 
-                    # Trailing: if up 20%+ — move stop to breakeven
                     if current_price >= entry * 1.20 and stop < entry:
                         pos["stop_price"] = entry
                         pos["trailing_activated"] = True
 
-                    # Check stop
                     if current_price <= stop:
+                        _sdk_sell(pos.get("clob_token_id"), pos["shares"])
                         pnl = round((current_price - entry) * pos["shares"], 2)
                         balance += pos["cost"] + pnl
                         pos["closed_at"]    = snap.get("ts")
@@ -571,13 +585,11 @@ def scan_and_update():
                         reason = "STOP" if current_price < entry else "TRAILING BE"
                         print(f"  [{reason}] {loc['name']} {date} | entry ${entry:.3f} exit ${current_price:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
 
-            # --- CLOSE POSITION if forecast shifted 2+ degrees ---
-            if mkt.get("position") and forecast_temp is not None:
+            # --- CLOSE POSITION if forecast shifted significantly ---
+            if mkt.get("position") and mkt["position"].get("status") == "open" and forecast_temp is not None:
                 pos = mkt["position"]
                 old_bucket_low  = pos["bucket_low"]
                 old_bucket_high = pos["bucket_high"]
-                # 2-degree buffer — avoid closing on small forecast fluctuations
-                unit = loc["unit"]
                 buffer = 2.0 if unit == "F" else 1.0
                 mid_bucket = (old_bucket_low + old_bucket_high) / 2 if old_bucket_low != -999 and old_bucket_high != 999 else forecast_temp
                 forecast_far = abs(forecast_temp - mid_bucket) > (abs(mid_bucket - old_bucket_low) + buffer)
@@ -588,13 +600,14 @@ def scan_and_update():
                             current_price = o["price"]
                             break
                     if current_price is not None:
+                        _sdk_sell(pos.get("clob_token_id"), pos["shares"])
                         pnl = round((current_price - pos["entry_price"]) * pos["shares"], 2)
                         balance += pos["cost"] + pnl
-                        mkt["position"]["closed_at"]    = snap.get("ts")
-                        mkt["position"]["close_reason"] = "forecast_changed"
-                        mkt["position"]["exit_price"]   = current_price
-                        mkt["position"]["pnl"]          = pnl
-                        mkt["position"]["status"]       = "closed"
+                        pos["closed_at"]    = snap.get("ts")
+                        pos["close_reason"] = "forecast_changed"
+                        pos["exit_price"]   = current_price
+                        pos["pnl"]          = pnl
+                        pos["status"]       = "closed"
                         closed += 1
                         print(f"  [CLOSE] {loc['name']} {date} — forecast changed | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
 
@@ -603,8 +616,6 @@ def scan_and_update():
                 sigma = get_sigma(city_slug, best_source or "ecmwf")
                 best_signal = None
 
-                # Find exactly ONE bucket that matches the forecast
-                # If forecast doesn't fit any bucket cleanly — skip this market
                 matched_bucket = None
                 for o in outcomes:
                     t_low, t_high = o["range"]
@@ -613,14 +624,13 @@ def scan_and_update():
                         break
 
                 if matched_bucket:
-                    o = matched_bucket
+                    o      = matched_bucket
                     t_low, t_high = o["range"]
                     volume = o["volume"]
                     bid    = o.get("bid", o["price"])
                     ask    = o.get("ask", o["price"])
                     spread = o.get("spread", 0)
 
-                    # All filters — if any fails, skip this market entirely
                     if volume >= MIN_VOLUME:
                         p  = bucket_prob(forecast_temp, t_low, t_high, sigma)
                         ev = calc_ev(p, ask)
@@ -629,39 +639,37 @@ def scan_and_update():
                             size  = bet_size(kelly, balance)
                             if size >= 0.50:
                                 best_signal = {
-                                    "market_id":    o["market_id"],
-                                    "question":     o["question"],
-                                    "bucket_low":   t_low,
-                                    "bucket_high":  t_high,
-                                    "entry_price":  ask,
-                                    "bid_at_entry": bid,
-                                    "spread":       spread,
-                                    "shares":       round(size / ask, 2),
-                                    "cost":         size,
-                                    "p":            round(p, 4),
-                                    "ev":           round(ev, 4),
-                                    "kelly":        round(kelly, 4),
-                                    "forecast_temp":forecast_temp,
-                                    "forecast_src": best_source,
-                                    "sigma":        sigma,
-                                    "opened_at":    snap.get("ts"),
-                                    "status":       "open",
-                                    "pnl":          None,
-                                    "exit_price":   None,
-                                    "close_reason": None,
-                                    "closed_at":    None,
+                                    "market_id":     o["market_id"],
+                                    "clob_token_id": o["clob_token_id"],
+                                    "question":      o["question"],
+                                    "bucket_low":    t_low,
+                                    "bucket_high":   t_high,
+                                    "entry_price":   ask,
+                                    "bid_at_entry":  bid,
+                                    "spread":        spread,
+                                    "shares":        round(size / ask, 2),
+                                    "cost":          size,
+                                    "p":             round(p, 4),
+                                    "ev":            round(ev, 4),
+                                    "kelly":         round(kelly, 4),
+                                    "forecast_temp": forecast_temp,
+                                    "forecast_src":  best_source,
+                                    "sigma":         sigma,
+                                    "opened_at":     snap.get("ts"),
+                                    "status":        "open",
+                                    "order_id":      None,
+                                    "pnl":           None,
+                                    "exit_price":    None,
+                                    "close_reason":  None,
+                                    "closed_at":     None,
                                 }
 
                 if best_signal:
-                    # Fetch real bestAsk from Polymarket API for accurate entry price
                     skip_position = False
                     try:
-                        r = requests.get(f"https://gamma-api.polymarket.com/markets/{best_signal['market_id']}", timeout=(3, 5))
-                        mdata = r.json()
-                        real_ask = float(mdata.get("bestAsk", best_signal["entry_price"]))
-                        real_bid = float(mdata.get("bestBid", best_signal["bid_at_entry"]))
-                        real_spread = round(real_ask - real_bid, 4)
-                        # Re-check slippage and price with real values
+                        real_ask    = float(_pm_client.get_price(token_id=best_signal["clob_token_id"], side="BUY"))
+                        real_bid    = float(_pm_client.get_price(token_id=best_signal["clob_token_id"], side="SELL"))
+                        real_spread = float(_pm_client.get_spread(token_id=best_signal["clob_token_id"]))
                         if real_spread > MAX_SLIPPAGE or real_ask >= MAX_PRICE:
                             print(f"  [SKIP] {loc['name']} {date} — real ask ${real_ask:.3f} spread ${real_spread:.3f}")
                             skip_position = True
@@ -675,16 +683,30 @@ def scan_and_update():
                         print(f"  [WARN] Could not fetch real ask for {best_signal['market_id']}: {e}")
 
                     if not skip_position and best_signal["entry_price"] < MAX_PRICE:
-                        balance -= best_signal["cost"]
-                        mkt["position"] = best_signal
-                        state["total_trades"] += 1
-                        new_pos += 1
-                        bucket_label = f"{best_signal['bucket_low']}-{best_signal['bucket_high']}{unit_sym}"
-                        print(f"  [BUY]  {loc['name']} {horizon} {date} | {bucket_label} | "
-                              f"${best_signal['entry_price']:.3f} | EV {best_signal['ev']:+.2f} | "
-                              f"${best_signal['cost']:.2f} ({best_signal['forecast_src'].upper()})")
+                        place_ok = True
+                        if LIVE_TRADING:
+                            try:
+                                resp = _pm_client.place_market_order(
+                                    token_id=best_signal["clob_token_id"],
+                                    side="BUY",
+                                    amount=Decimal(str(best_signal["cost"])),
+                                )
+                                best_signal["order_id"] = str(resp.order_id) if resp and resp.order_id else None
+                            except Exception as e:
+                                print(f"  [ORDER FAIL] {e} — skipping")
+                                place_ok = False
 
-            # Market closed by time
+                        if place_ok:
+                            balance -= best_signal["cost"]
+                            mkt["position"] = best_signal
+                            state["total_trades"] += 1
+                            new_pos += 1
+                            bucket_label = f"{best_signal['bucket_low']}-{best_signal['bucket_high']}{unit_sym}"
+                            mode = "LIVE" if LIVE_TRADING else "PAPER"
+                            print(f"  [BUY/{mode}] {loc['name']} {horizon} {date} | {bucket_label} | "
+                                  f"${best_signal['entry_price']:.3f} | EV {best_signal['ev']:+.2f} | "
+                                  f"${best_signal['cost']:.2f} ({best_signal['forecast_src'].upper()})")
+
             if hours < 0.5 and mkt["status"] == "open":
                 mkt["status"] = "closed"
 
@@ -706,12 +728,10 @@ def scan_and_update():
         if not market_id:
             continue
 
-        # Check if market closed on Polymarket
         won = check_market_resolved(market_id)
         if won is None:
-            continue  # market still open
+            continue
 
-        # Market closed — record result
         price  = pos["entry_price"]
         size   = pos["cost"]
         shares = pos["shares"]
@@ -743,7 +763,6 @@ def scan_and_update():
     state["peak_balance"] = max(state.get("peak_balance", balance), balance)
     save_state(state)
 
-    # Run calibration if enough data collected
     all_mkts = load_all_markets()
     resolved_count = len([m for m in all_mkts if m["status"] == "resolved"])
     if resolved_count >= CALIBRATION_MIN:
@@ -772,6 +791,7 @@ def print_status():
     print(f"\n{'='*55}")
     print(f"  WEATHERBET — STATUS")
     print(f"{'='*55}")
+    print(f"  Mode:        {'LIVE' if LIVE_TRADING else 'PAPER'}")
     print(f"  Balance:     ${bal:,.2f}  (start ${start:,.2f}, {'+'if ret_pct>=0 else ''}{ret_pct:.1f}%)")
     print(f"  Trades:      {total} | W: {wins} | L: {losses} | WR: {wins/total:.0%}" if total else "  No trades yet")
     print(f"  Open:        {len(open_pos)}")
@@ -785,15 +805,11 @@ def print_status():
             unit_sym = "F" if m["unit"] == "F" else "C"
             label    = f"{pos['bucket_low']}-{pos['bucket_high']}{unit_sym}"
 
-            # Current price from latest market snapshot
             current_price = pos["entry_price"]
-            snaps = m.get("market_snapshots", [])
-            if snaps:
-                # Find our bucket price in all_outcomes
-                for o in m.get("all_outcomes", []):
-                    if o["market_id"] == pos["market_id"]:
-                        current_price = o["price"]
-                        break
+            for o in m.get("all_outcomes", []):
+                if o["market_id"] == pos["market_id"]:
+                    current_price = o["price"]
+                    break
 
             unrealized = round((current_price - pos["entry_price"]) * pos["shares"], 2)
             total_unrealized += unrealized
@@ -857,7 +873,7 @@ def print_report():
 # MAIN LOOP
 # =============================================================================
 
-MONITOR_INTERVAL = 600  # monitor positions every 10 minutes
+MONITOR_INTERVAL = 600
 
 def monitor_positions():
     """Quick stop check on open positions without full scan."""
@@ -871,22 +887,20 @@ def monitor_positions():
     closed  = 0
 
     for mkt in open_pos:
-        pos = mkt["position"]
-        mid = pos["market_id"]
+        pos           = mkt["position"]
+        clob_token_id = pos.get("clob_token_id")
 
-        # Fetch real bestBid from Polymarket API — actual sell price
+        # Fetch real bid from CLOB via SDK
         current_price = None
-        try:
-            r = requests.get(f"https://gamma-api.polymarket.com/markets/{mid}", timeout=(3, 5))
-            mdata = r.json()
-            best_bid = mdata.get("bestBid")
-            if best_bid is not None:
-                current_price = float(best_bid)
-        except Exception:
-            pass
+        if clob_token_id:
+            try:
+                current_price = float(_pm_client.get_price(token_id=clob_token_id, side="SELL"))
+            except Exception:
+                pass
 
-        # Fallback to cached price if API failed
+        # Fallback to cached outcome price
         if current_price is None:
+            mid = pos.get("market_id")
             for o in mkt.get("all_outcomes", []):
                 if o["market_id"] == mid:
                     current_price = o.get("bid", o["price"])
@@ -895,37 +909,32 @@ def monitor_positions():
         if current_price is None:
             continue
 
-        entry = pos["entry_price"]
-        stop  = pos.get("stop_price", entry * 0.80)
+        entry     = pos["entry_price"]
+        stop      = pos.get("stop_price", entry * 0.80)
         city_name = LOCATIONS.get(mkt["city"], {}).get("name", mkt["city"])
-
-        # Hours left to resolution
-        end_date = mkt.get("event_end_date", "")
+        end_date  = mkt.get("event_end_date", "")
         hours_left = hours_to_resolution(end_date) if end_date else 999.0
 
-        # Take-profit threshold based on hours to resolution
         if hours_left < 24:
-            take_profit = None        # hold to resolution
+            take_profit = None
         elif hours_left < 48:
-            take_profit = 0.85        # 24-48h: take profit at $0.85
+            take_profit = 0.85
         else:
-            take_profit = 0.75        # 48h+: take profit at $0.75
+            take_profit = 0.75
 
-        # Trailing: if up 20%+ — move stop to breakeven
         if current_price >= entry * 1.20 and stop < entry:
             pos["stop_price"] = entry
             pos["trailing_activated"] = True
             print(f"  [TRAILING] {city_name} {mkt['date']} — stop moved to breakeven ${entry:.3f}")
 
-        # Check take-profit
         take_triggered = take_profit is not None and current_price >= take_profit
-        # Check stop
         stop_triggered = current_price <= stop
 
         if take_triggered or stop_triggered:
+            _sdk_sell(clob_token_id, pos["shares"])
             pnl = round((current_price - entry) * pos["shares"], 2)
             balance += pos["cost"] + pnl
-            pos["closed_at"]    = datetime.now(timezone.utc).isoformat()
+            pos["closed_at"] = datetime.now(timezone.utc).isoformat()
             if take_triggered:
                 pos["close_reason"] = "take_profit"
                 reason = "TAKE"
@@ -935,9 +944,9 @@ def monitor_positions():
             else:
                 pos["close_reason"] = "trailing_stop"
                 reason = "TRAILING BE"
-            pos["exit_price"]   = current_price
-            pos["pnl"]          = pnl
-            pos["status"]       = "closed"
+            pos["exit_price"] = current_price
+            pos["pnl"]        = pnl
+            pos["status"]     = "closed"
             closed += 1
             print(f"  [{reason}] {city_name} {mkt['date']} | entry ${entry:.3f} exit ${current_price:.3f} | {hours_left:.0f}h left | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
             save_market(mkt)
@@ -950,12 +959,21 @@ def monitor_positions():
 
 
 def run_loop():
-    global _cal
+    global _cal, _pm_client
     _cal = load_cal()
+
+    if LIVE_TRADING:
+        pk = os.environ.get("POLYMARKET_PRIVATE_KEY")
+        if not pk:
+            raise RuntimeError("POLYMARKET_PRIVATE_KEY not set — export it or add to ~/.hermes/.env")
+        _pm_client = SecureClient.create(private_key=pk)
+    else:
+        _pm_client = PublicClient()
 
     print(f"\n{'='*55}")
     print(f"  WEATHERBET — STARTING")
     print(f"{'='*55}")
+    print(f"  Mode:       {'LIVE' if LIVE_TRADING else 'PAPER'}")
     print(f"  Cities:     {len(LOCATIONS)}")
     print(f"  Balance:    ${BALANCE:,.0f} | Max bet: ${MAX_BET}")
     print(f"  Scan:       {SCAN_INTERVAL//60} min | Monitor: {MONITOR_INTERVAL//60} min")
@@ -969,7 +987,6 @@ def run_loop():
         now_ts  = time.time()
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Full scan once per hour
         if now_ts - last_full_scan >= SCAN_INTERVAL:
             print(f"[{now_str}] full scan...")
             try:
@@ -992,7 +1009,6 @@ def run_loop():
                 time.sleep(60)
                 continue
         else:
-            # Quick stop monitoring
             print(f"[{now_str}] monitoring positions...")
             try:
                 stopped = monitor_positions()

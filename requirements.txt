@@ -1,0 +1,5 @@
+requests
+python-dotenv
+# polymarket-client is in pre-release — install with:
+# pip install --pre polymarket-client
+polymarket-client
