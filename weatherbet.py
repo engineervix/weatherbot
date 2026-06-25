@@ -229,6 +229,13 @@ def recalibrate_params(markets):
         global MIN_EV, KELLY_FRACTION
         MIN_EV         = cfg["min_ev"]
         KELLY_FRACTION = cfg["kelly_fraction"]
+        cal = load_cal()
+        cal.setdefault("param_history", []).append({
+            "ts":         datetime.now(timezone.utc).isoformat(),
+            "changes":    updates,
+            "n_resolved": len(resolved),
+        })
+        CALIBRATION_FILE.write_text(json.dumps(cal, indent=2), encoding="utf-8")
 
 # =============================================================================
 # FORECASTS
