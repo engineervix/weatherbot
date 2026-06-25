@@ -59,6 +59,7 @@ STATE_FILE       = DATA_DIR / "state.json"
 MARKETS_DIR      = DATA_DIR / "markets"
 MARKETS_DIR.mkdir(exist_ok=True)
 CALIBRATION_FILE = DATA_DIR / "calibration.json"
+REJECTIONS_FILE  = DATA_DIR / "rejections.jsonl"
 
 LOCATIONS = {
     "nyc":          {"lat": 40.7772,  "lon":  -73.8726, "name": "New York City", "station": "KLGA", "unit": "F", "region": "us"},
@@ -178,6 +179,56 @@ def run_calibration(markets):
     if updated:
         print(f"  [CAL] {', '.join(updated)}")
     return cal
+
+
+def recalibrate_params(markets):
+    """Adjusts min_ev and kelly_fraction based on resolved trade performance."""
+    resolved = [
+        m for m in markets
+        if m["status"] == "resolved"
+        and m.get("position")
+        and m["position"].get("close_reason") == "resolved"
+        and m["position"].get("ev") is not None
+    ]
+    if len(resolved) < CALIBRATION_MIN:
+        return
+
+    with open("config.json", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    updates = []
+
+    # min_ev: examine the marginal EV bucket [min_ev, min_ev + 0.08)
+    cur_min_ev = cfg["min_ev"]
+    marginal = [m for m in resolved if cur_min_ev <= m["position"]["ev"] < cur_min_ev + 0.08]
+    if len(marginal) >= 15:
+        wr = sum(1 for m in marginal if m["resolved_outcome"] == "win") / len(marginal)
+        if wr < 0.45 and cur_min_ev < 0.28:
+            cfg["min_ev"] = round(cur_min_ev + 0.02, 3)
+            updates.append(f"min_ev {cur_min_ev:.3f}→{cfg['min_ev']:.3f} (marginal WR {wr:.0%})")
+        elif wr > 0.70 and cur_min_ev > 0.06:
+            cfg["min_ev"] = round(cur_min_ev - 0.01, 3)
+            updates.append(f"min_ev {cur_min_ev:.3f}→{cfg['min_ev']:.3f} (marginal WR {wr:.0%})")
+
+    # kelly_fraction: adjust on overall win rate (requires 2× calibration_min)
+    cur_kf = cfg["kelly_fraction"]
+    if len(resolved) >= CALIBRATION_MIN * 2:
+        wins   = sum(1 for m in resolved if m["resolved_outcome"] == "win")
+        wr_all = wins / len(resolved)
+        if wr_all > 0.62 and cur_kf < 0.45:
+            cfg["kelly_fraction"] = round(cur_kf + 0.02, 3)
+            updates.append(f"kelly {cur_kf:.3f}→{cfg['kelly_fraction']:.3f} (WR {wr_all:.0%})")
+        elif wr_all < 0.40 and cur_kf > 0.12:
+            cfg["kelly_fraction"] = round(cur_kf - 0.02, 3)
+            updates.append(f"kelly {cur_kf:.3f}→{cfg['kelly_fraction']:.3f} (WR {wr_all:.0%})")
+
+    if updates:
+        with open("config.json", "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        print(f"  [PARAMS] {', '.join(updates)}")
+        global MIN_EV, KELLY_FRACTION
+        MIN_EV         = cfg["min_ev"]
+        KELLY_FRACTION = cfg["kelly_fraction"]
 
 # =============================================================================
 # FORECASTS
@@ -411,6 +462,32 @@ def save_state(state):
 # =============================================================================
 # CORE LOGIC
 # =============================================================================
+
+def _log_rejection(city_slug, date_str, horizon, ts, t_low, t_high, ask, ev, volume, spread, sigma, reason):
+    """Appends a skipped signal to the rejection log."""
+    loc = LOCATIONS[city_slug]
+    entry = {
+        "ts":          ts,
+        "city":        city_slug,
+        "city_name":   loc["name"],
+        "date":        date_str,
+        "horizon":     horizon,
+        "unit":        loc["unit"],
+        "bucket_low":  t_low,
+        "bucket_high": t_high,
+        "ask":         ask,
+        "ev":          ev,
+        "volume":      volume,
+        "spread":      spread,
+        "sigma":       sigma,
+        "reason":      reason,
+    }
+    try:
+        with REJECTIONS_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, default=str) + "\n")
+    except Exception:
+        pass
+
 
 def take_forecast_snapshot(city_slug, dates):
     """Fetches forecasts from all sources and returns a snapshot."""
@@ -663,6 +740,10 @@ def scan_and_update():
                                     "close_reason":  None,
                                     "closed_at":     None,
                                 }
+                        else:
+                            _log_rejection(city_slug, date, horizon, snap.get("ts"), t_low, t_high, ask, round(ev, 4), volume, spread, sigma, "low_ev")
+                    else:
+                        _log_rejection(city_slug, date, horizon, snap.get("ts"), t_low, t_high, ask, None, volume, spread, sigma, "low_volume")
 
                 if best_signal:
                     skip_position = False
@@ -673,6 +754,7 @@ def scan_and_update():
                         if real_spread > MAX_SLIPPAGE or real_ask >= MAX_PRICE:
                             print(f"  [SKIP] {loc['name']} {date} — real ask ${real_ask:.3f} spread ${real_spread:.3f}")
                             skip_position = True
+                            _log_rejection(city_slug, date, horizon, snap.get("ts"), best_signal["bucket_low"], best_signal["bucket_high"], real_ask, best_signal["ev"], None, real_spread, best_signal["sigma"], "slippage")
                         else:
                             best_signal["entry_price"]  = real_ask
                             best_signal["bid_at_entry"] = real_bid
@@ -768,6 +850,7 @@ def scan_and_update():
     if resolved_count >= CALIBRATION_MIN:
         global _cal
         _cal = run_calibration(all_mkts)
+        recalibrate_params(all_mkts)
 
     return new_pos, closed, resolved
 
@@ -967,6 +1050,7 @@ def run_loop():
         if not pk:
             raise RuntimeError("POLYMARKET_PRIVATE_KEY not set — export it or add to ~/.hermes/.env")
         _pm_client = SecureClient.create(private_key=pk)
+        _pm_client.setup_trading_approvals()
     else:
         _pm_client = PublicClient()
 
