@@ -654,7 +654,8 @@ def scan_and_update():
                     entry = pos["entry_price"]
                     stop  = pos.get("stop_price", entry * 0.80)
 
-                    if current_price >= entry * 1.20 and stop < entry:
+                    # Skip trailing-stop ratchet on sub-0.10 entries (noisy tail plays).
+                    if entry >= 0.10 and current_price >= entry * 1.20 and stop < entry:
                         pos["stop_price"] = entry
                         pos["trailing_activated"] = True
 
@@ -1018,7 +1019,10 @@ def monitor_positions():
         else:
             take_profit = 0.75
 
-        if current_price >= entry * 1.20 and stop < entry:
+        # Trailing-to-breakeven only meaningful for entries where a 1-2 cent bid
+        # drop isn't a structural move. Sub-0.10 entries are noisy tail plays;
+        # keep the hard 20% stop, don't ratchet to breakeven. Added 2026-06-26.
+        if entry >= 0.10 and current_price >= entry * 1.20 and stop < entry:
             pos["stop_price"] = entry
             pos["trailing_activated"] = True
             print(f"  [TRAILING] {city_name} {mkt['date']} — stop moved to breakeven ${entry:.3f}")
