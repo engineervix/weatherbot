@@ -434,3 +434,9 @@ $RECYCLE.BIN/
 # End of https://www.toptal.com/developers/gitignore/api/macos,windows,linux,dotenv,svelte,python,vim,node,visualstudiocode
 data/
 _references/
+
+# Local analysis tooling — not part of the bot. Keep these on this machine
+# only; report cron jobs invoke them with hardcoded paths.
+compute_report.py
+monitor_report.py
+inspect_market.py
