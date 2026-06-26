@@ -649,6 +649,8 @@ def scan_and_update():
                         break
 
                 if current_price is not None:
+                    pos["current_price"] = current_price
+                    pos["current_price_ts"] = snap.get("ts")
                     entry = pos["entry_price"]
                     stop  = pos.get("stop_price", entry * 0.80)
 
@@ -998,6 +1000,10 @@ def monitor_positions():
 
         if current_price is None:
             continue
+
+        pos["current_price"] = current_price
+        pos["current_price_ts"] = datetime.now(timezone.utc).isoformat()
+        save_market(mkt)
 
         entry     = pos["entry_price"]
         stop      = pos.get("stop_price", entry * 0.80)
