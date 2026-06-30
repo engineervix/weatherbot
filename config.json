@@ -1,7 +1,7 @@
 {
   "balance": 10000.0,
   "max_bet": 20.0,
-  "min_ev": 0.1,
+  "min_ev": 0.10,
   "max_price": 0.45,
   "min_volume": 500,
   "min_hours": 2.0,
@@ -10,5 +10,7 @@
   "scan_interval": 3600,
   "calibration_min": 30,
   "max_slippage": 0.03,
+  "max_city_mae": 1.5,
+  "min_city_samples": 5,
   "live_trading": false
 }

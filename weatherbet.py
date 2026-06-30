@@ -19,6 +19,7 @@ import sys
 import json
 import math
 import time
+import signal
 import requests
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
@@ -49,6 +50,8 @@ SCAN_INTERVAL    = _cfg.get("scan_interval", 3600)
 CALIBRATION_MIN  = _cfg.get("calibration_min", 30)
 VC_KEY           = os.environ.get("VC_KEY", _cfg.get("vc_key", ""))
 LIVE_TRADING     = _cfg.get("live_trading", False)
+MAX_CITY_MAE     = _cfg.get("max_city_mae", 1.5)  # gate: skip cities whose historical MAE exceeds this
+MIN_CITY_SAMPLES = _cfg.get("min_city_samples", 5) # need at least this many resolved markets to apply the gate
 
 SIGMA_F = 2.0
 SIGMA_C = 1.2
@@ -111,13 +114,23 @@ def norm_cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 def bucket_prob(forecast, t_low, t_high, sigma=None):
-    """For regular buckets — exact match. For edge buckets — normal distribution."""
+    """Probability the actual temp falls in [t_low, t_high] under N(forecast, sigma).
+
+    Edge buckets (t_low=-999 or t_high=999) use the one-sided tail.
+    For regular buckets we integrate the normal CDF over the bucket width so the
+    result is a proper probability in (0, 1) — required for the EV filter to
+    measure edge over the market, not just payoff multiple.
+    """
     s = sigma or 2.0
+    f = float(forecast)
     if t_low == -999:
-        return norm_cdf((t_high - float(forecast)) / s)
+        return norm_cdf((t_high - f) / s)
     if t_high == 999:
-        return 1.0 - norm_cdf((t_low - float(forecast)) / s)
-    return 1.0 if in_bucket(forecast, t_low, t_high) else 0.0
+        return 1.0 - norm_cdf((t_low - f) / s)
+    # Regular bucket: P(t_low <= X <= t_high) = CDF(high) - CDF(low - 1)
+    # Use low-1 as the lower boundary so an exact integer forecast has the
+    # mass for the whole unit-width bucket (Polymarket buckets are integer-°C/F).
+    return max(0.0, norm_cdf((t_high - f) / s) - norm_cdf((t_low - 1.0 - f) / s))
 
 def calc_ev(p, price):
     if price <= 0 or price >= 1: return 0.0
@@ -150,9 +163,30 @@ def get_sigma(city_slug, source="ecmwf"):
         return _cal[key]["sigma"]
     return SIGMA_F if LOCATIONS[city_slug]["unit"] == "F" else SIGMA_C
 
+
+def get_city_stats(city_slug):
+    """Returns (n_samples, mae) for a city from calibration data, or (0, None)."""
+    key = f"{city_slug}_mae"
+    entry = _cal.get(key)
+    if not entry:
+        return 0, None
+    return entry.get("n", 0), entry.get("mae")
+
+
+def city_blocked(city_slug):
+    """True if we have enough samples for this city AND its MAE is over the gate.
+
+    Cities with no/few samples are allowed through — we only block what we have
+    evidence for.
+    """
+    n, mae = get_city_stats(city_slug)
+    if n < MIN_CITY_SAMPLES or mae is None:
+        return False
+    return mae > MAX_CITY_MAE
+
 def run_calibration(markets):
-    """Recalculates sigma from resolved markets."""
-    resolved = [m for m in markets if m.get("resolved") and m.get("actual_temp") is not None]
+    """Recalculates sigmas and per-city MAE from resolved markets with actuals."""
+    resolved = [m for m in markets if m.get("status") == "resolved" and m.get("actual_temp") is not None]
     cal = load_cal()
     updated = []
 
@@ -162,7 +196,7 @@ def run_calibration(markets):
             errors = []
             for m in group:
                 snap = next((s for s in reversed(m.get("forecast_snapshots", []))
-                             if s["source"] == source), None)
+                             if s.get("source") == source), None)
                 if snap and snap.get("temp") is not None:
                     errors.append(abs(snap["temp"] - m["actual_temp"]))
             if len(errors) < CALIBRATION_MIN:
@@ -174,6 +208,28 @@ def run_calibration(markets):
             cal[key] = {"sigma": new, "n": len(errors), "updated_at": datetime.now(timezone.utc).isoformat()}
             if abs(new - old) > 0.05:
                 updated.append(f"{LOCATIONS[city]['name']} {source}: {old:.2f}->{new:.2f}")
+
+    # Per-city MAE — uses the `best` forecast (the one the strategy actually bets on).
+    # Lower threshold than per-source sigmas because we want this to populate quickly
+    # so the city filter has data to act on.
+    city_cal_min = min(CALIBRATION_MIN, 5)
+    for city in set(m["city"] for m in resolved):
+        group = [m for m in resolved if m["city"] == city]
+        errs = []
+        for m in group:
+            snap = m.get("forecast_snapshots", [])
+            if not snap: continue
+            best = snap[-1].get("best")
+            if best is None: continue
+            errs.append(abs(best - m["actual_temp"]))
+        if len(errs) < city_cal_min:
+            continue
+        mae = round(sum(errs) / len(errs), 3)
+        key = f"{city}_mae"
+        old = cal.get(key, {}).get("mae")
+        cal[key] = {"mae": mae, "n": len(errs), "updated_at": datetime.now(timezone.utc).isoformat()}
+        if old is None or abs(mae - old) > 0.1:
+            updated.append(f"{LOCATIONS[city]['name']} MAE: {old}->{mae} (n={len(errs)})")
 
     CALIBRATION_FILE.write_text(json.dumps(cal, indent=2), encoding="utf-8")
     if updated:
@@ -335,6 +391,28 @@ def get_actual_temp(city_slug, date_str):
         print(f"  [VC] {city_slug} {date_str}: {e}")
     return None
 
+def _record_actual(mkt):
+    """Fetch and persist the actual high temperature via Visual Crossing.
+
+    Called whenever a market has closed (natural resolution, stop, or
+    forecast-changed exit) so we accumulate an independent ground-truth
+    record. Without this we can't evaluate the model — `check_market_resolved`
+    only asks Polymarket whether YES or NO won, not the actual temperature.
+    """
+    if mkt.get("actual_temp") is not None:
+        return
+    city = mkt.get("city")
+    date = mkt.get("date")
+    if not city or not date:
+        return
+    try:
+        actual = get_actual_temp(city, date)
+        if actual is not None:
+            mkt["actual_temp"] = actual
+    except Exception:
+        pass
+
+
 def check_market_resolved(market_id):
     """
     Checks if the market closed on Polymarket and who won.
@@ -361,6 +439,40 @@ def check_market_resolved(market_id):
 # =============================================================================
 # POLYMARKET
 # =============================================================================
+
+# The polymarket SDK's get_event can hang indefinitely on certain markets
+# (notably Wellington) because its default httpx client uses connection
+# pooling with a keepalive pool. We monkey-patch SyncTransport below to
+# create a non-pooled client with a tight per-request timeout, so each
+# request gets a fresh connection and a hard 15s read deadline.
+
+
+from polymarket.clients._transport import SyncTransport as _PM_SyncTransport
+
+# Wrap SyncTransport so the httpx client is created with connection pooling
+# DISABLED and a tighter per-request timeout. The default keepalive pool
+# hangs on certain markets (notably Wellington) — disabling pooling and
+# using a fresh connection each time makes hangs effectively impossible.
+_orig_pm_init = _PM_SyncTransport.__init__
+def _patched_pm_init(self, *args, **kwargs):
+    _orig_pm_init(self, *args, **kwargs)
+    if self._owns_client:
+        # Replace the SDK's pooled client with a non-pooled, shorter-timeout one.
+        try:
+            self._client.close()
+        except Exception:
+            pass
+        import httpx
+        # base_url might be stored differently; pull it from the original client
+        base_url = getattr(self._client, '_base_url', None) or self._client.base_url
+        self._client = httpx.Client(
+            base_url=str(base_url),
+            timeout=httpx.Timeout(connect=5.0, read=15.0, write=10.0, pool=2.0),
+            limits=httpx.Limits(max_connections=1, max_keepalive_connections=0, keepalive_expiry=0),
+            http2=False,
+        )
+_PM_SyncTransport.__init__ = _patched_pm_init
+
 
 def get_polymarket_event(city_slug, month, day, year):
     """Fetches the Polymarket event for the given city/date. Returns SDK Event or None."""
@@ -550,8 +662,20 @@ def scan_and_update():
     for city_slug, loc in LOCATIONS.items():
         unit = loc["unit"]
         unit_sym = "F" if unit == "F" else "C"
+        if city_blocked(city_slug):
+            n, mae = get_city_stats(city_slug)
+            print(f"  -> {loc['name']}... blocked (MAE {mae:.2f} > {MAX_CITY_MAE} over {n} samples)")
+            continue
         print(f"  -> {loc['name']}...", end=" ", flush=True)
 
+        # Per-city 60s hard cap so one stuck API call (notably Wellington's
+        # hung Polymarket get_event) can't freeze the scan loop. signal.alarm
+        # only fires on the main thread, but the SDK calls we're worried about
+        # are synchronous on the main thread too — so this works.
+        def _city_timeout(signum, frame):
+            raise TimeoutError("city scan timeout")
+        old_alarm = signal.signal(signal.SIGALRM, _city_timeout)
+        signal.alarm(60)
         try:
             dates = [(now + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(4)]
             snapshots = take_forecast_snapshot(city_slug, dates)
@@ -559,6 +683,13 @@ def scan_and_update():
         except Exception as e:
             print(f"skipped ({e})")
             continue
+
+        # 60s per-city hard cap covers the whole date loop below. If a
+        # get_polymarket_event call hangs (notably on Wellington), the
+        # TimeoutError propagates up to run_loop's outer try/except, which
+        # logs and continues — better than freezing the scan forever.
+        signal.signal(signal.SIGALRM, _city_timeout)
+        signal.alarm(60)
 
         for i, date in enumerate(dates):
             dt    = datetime.strptime(date, "%Y-%m-%d")
@@ -802,9 +933,16 @@ def scan_and_update():
             if hours < 0.5 and mkt["status"] == "open":
                 mkt["status"] = "closed"
 
+            # Record actual temp if the market's date is in the past — needed
+            # for calibration. VC is cheap, this only runs once per market.
+            if date < now.strftime("%Y-%m-%d"):
+                _record_actual(mkt)
+
             save_market(mkt)
             time.sleep(0.1)
 
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_alarm)
         print("ok")
 
     # --- AUTO-RESOLUTION ---
@@ -838,6 +976,7 @@ def scan_and_update():
         mkt["pnl"]          = pnl
         mkt["status"]       = "resolved"
         mkt["resolved_outcome"] = "win" if won else "loss"
+        _record_actual(mkt)
 
         if won:
             state["wins"] += 1
@@ -857,9 +996,12 @@ def scan_and_update():
 
     all_mkts = load_all_markets()
     resolved_count = len([m for m in all_mkts if m["status"] == "resolved"])
-    if resolved_count >= CALIBRATION_MIN:
-        global _cal
+    # Always refresh city-MAE so the city filter has fresh data (needs only 5 samples).
+    # Per-source sigmas + param recalibration stay gated on CALIBRATION_MIN.
+    global _cal
+    if any(m.get("status") == "resolved" and m.get("actual_temp") is not None for m in all_mkts):
         _cal = run_calibration(all_mkts)
+    if resolved_count >= CALIBRATION_MIN:
         recalibrate_params(all_mkts)
 
     return new_pos, closed, resolved
